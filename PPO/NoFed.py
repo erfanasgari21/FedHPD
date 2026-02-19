@@ -2,9 +2,10 @@ import gymnasium as gym
 import numpy as np
 import torch
 import torch.optim as optim
+import torch.nn as nn
 import pandas as pd
 from datetime import datetime
-from torch.distributions import Categorical
+from collections import deque
 from policy import PPOActorCriticNetwork
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
@@ -12,11 +13,54 @@ from tqdm import tqdm
 device = torch.device("cpu")
 
 # PPO Hyperparameters
-PPO_EPOCHS    = 4
-PPO_CLIP      = 0.2
-VALUE_COEF    = 0.5
-ENTROPY_COEF  = 0.01
-MAX_GRAD_NORM = 0.5
+PPO_EPOCHS     = 4
+PPO_CLIP       = 0.2
+VALUE_COEF     = 0.5
+ENTROPY_COEF   = 0.01
+MAX_GRAD_NORM  = 0.5
+ROLLOUT_LENGTH = 2048
+BATCH_SIZE     = 64
+GAE_LAMBDA     = 0.95
+
+
+class RolloutBuffer:
+    def __init__(self):
+        self.clear()
+
+    def add(self, state, action, log_prob, reward, done, value):
+        self.states.append(state)
+        self.actions.append(action)
+        self.log_probs.append(log_prob)
+        self.rewards.append(reward)
+        self.dones.append(done)
+        self.values.append(value)
+
+    def compute_returns_and_advantages(self, gamma, gae_lambda):
+        advantages = []
+        gae        = 0
+        next_value = 0
+
+        for t in reversed(range(len(self.rewards))):
+            mask       = 1.0 - float(self.dones[t])
+            delta      = self.rewards[t] + gamma * next_value * mask - self.values[t]
+            gae        = delta + gamma * gae_lambda * mask * gae
+            advantages.insert(0, gae)
+            next_value = self.values[t]
+
+        advantages = torch.tensor(advantages, dtype=torch.float32)
+        returns    = advantages + torch.tensor(self.values, dtype=torch.float32)
+        return returns, advantages
+
+    def clear(self):
+        self.states    = []
+        self.actions   = []
+        self.log_probs = []
+        self.rewards   = []
+        self.dones     = []
+        self.values    = []
+
+    def __len__(self):
+        return len(self.rewards)
 
 
 class Agent:
@@ -27,70 +71,75 @@ class Agent:
         self.policy    = PPOActorCriticNetwork(state_size, action_size, hidden_sizes, activation_fn).to(self.device)
         self.optimizer = optim.Adam(self.policy.parameters(), lr=lr)
         self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=100, gamma=0.95)
+        self.buffer    = RolloutBuffer()
 
-    def train_ppo(self):
-        obs, _ = self.env.reset()
-        states, actions, log_probs_old, rewards, values = [], [], [], [], []
-        done = False
-
+    def select_action(self, state):
+        state_t = torch.tensor(state, dtype=torch.float32).to(self.device)
         with torch.no_grad():
-            while not done:
-                state        = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
-                action_probs, value = self.policy(state)
+            action, log_prob, value = self.policy.act(state_t)
+        return action.item(), log_prob.item(), value.item()
 
-                dist     = Categorical(action_probs)
-                action   = dist.sample()
-                log_prob = dist.log_prob(action)
+    def update(self):
+        states        = torch.tensor(np.array(self.buffer.states),  dtype=torch.float32).to(self.device)
+        actions       = torch.tensor(np.array(self.buffer.actions), dtype=torch.long).to(self.device)
+        old_log_probs = torch.tensor(self.buffer.log_probs,         dtype=torch.float32).to(self.device)
 
-                next_obs, reward, terminated, truncated, _ = self.env.step(action.item())
-                done = terminated or truncated
+        returns, advantages = self.buffer.compute_returns_and_advantages(self.gamma, GAE_LAMBDA)
+        returns    = returns.to(self.device)
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        advantages = advantages.to(self.device)
 
-                states.append(state)
-                actions.append(action)
-                log_probs_old.append(log_prob)
-                rewards.append(reward)
-                values.append(value.squeeze())
-
-                obs = next_obs
-
-        # Discounted returns
-        returns = []
-        G = 0
-        for r in reversed(rewards):
-            G = r + self.gamma * G
-            returns.insert(0, G)
-
-        returns       = torch.tensor(returns, dtype=torch.float32).to(self.device)
-        returns       = (returns - returns.mean()) / (returns.std() + 1e-5)
-
-        values_tensor = torch.stack(values).to(self.device)
-        advantages    = returns - values_tensor.detach()
-        advantages    = (advantages - advantages.mean()) / (advantages.std() + 1e-5)
-
-        states_tensor   = torch.cat(states, dim=0)
-        actions_tensor  = torch.cat(actions, dim=0)
-        log_probs_old_t = torch.cat([lp.unsqueeze(0) for lp in log_probs_old]).to(self.device)
+        dataset_size = states.size(0)
+        indices      = np.arange(dataset_size)
 
         for _ in range(PPO_EPOCHS):
-            action_probs_new, values_new = self.policy(states_tensor)
-            dist_new      = Categorical(action_probs_new)
-            log_probs_new = dist_new.log_prob(actions_tensor)
-            entropy       = dist_new.entropy().mean()
+            np.random.shuffle(indices)
+            for start in range(0, dataset_size, BATCH_SIZE):
+                batch_idx = indices[start: start + BATCH_SIZE]
 
-            ratio  = torch.exp(log_probs_new - log_probs_old_t)
-            surr1  = ratio * advantages
-            surr2  = torch.clamp(ratio, 1.0 - PPO_CLIP, 1.0 + PPO_CLIP) * advantages
-            actor_loss  = -torch.min(surr1, surr2).mean()
-            critic_loss = VALUE_COEF * torch.nn.functional.mse_loss(values_new.squeeze(), returns)
-            loss        = actor_loss + critic_loss - ENTROPY_COEF * entropy
+                log_probs, entropy, values = self.policy.evaluate(
+                    states[batch_idx], actions[batch_idx]
+                )
 
-            self.optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), MAX_GRAD_NORM)
-            self.optimizer.step()
+                ratio  = torch.exp(log_probs - old_log_probs[batch_idx])
+                surr1  = ratio * advantages[batch_idx]
+                surr2  = torch.clamp(ratio, 1 - PPO_CLIP, 1 + PPO_CLIP) * advantages[batch_idx]
+
+                policy_loss  = -torch.min(surr1, surr2).mean()
+                value_loss   = (returns[batch_idx] - values).pow(2).mean()
+                entropy_loss = entropy.mean()
+
+                loss = policy_loss + VALUE_COEF * value_loss - ENTROPY_COEF * entropy_loss
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.policy.parameters(), MAX_GRAD_NORM)
+                self.optimizer.step()
+
+        self.buffer.clear()
+
+    def run_episode(self):
+        state, _  = self.env.reset()
+        ep_reward = 0
+        done      = False
+
+        while not done:
+            action, log_prob, value = self.select_action(state)
+            next_state, reward, terminated, truncated, _ = self.env.step(action)
+            done = terminated or truncated
+
+            self.buffer.add(state, action, log_prob, reward, done, value)
+            state      = next_state
+            ep_reward += reward
+
+            if len(self.buffer) >= ROLLOUT_LENGTH:
+                self.update()
+
+        if len(self.buffer) > 0:
+            self.update()
 
         self.scheduler.step()
-        return sum(rewards)
+        return ep_reward
 
 
 def main(seed, episodes, run):
@@ -128,11 +177,11 @@ def main(seed, episodes, run):
     rewards_per_agent = [[] for _ in range(agents_count)]
     average_rewards   = []
 
-    pbar = tqdm(range(episodes), unit="ep")
+    pbar = tqdm(range(episodes), desc=f"Seed {seed}", unit="ep")
     for episode in pbar:
 
         with ThreadPoolExecutor(max_workers=agents_count) as executor:
-            total_rewards = list(executor.map(lambda a: a.train_ppo(), agents))
+            total_rewards = list(executor.map(lambda a: a.run_episode(), agents))
 
         for i, reward in enumerate(total_rewards):
             rewards_per_agent[i].append(reward)
@@ -159,16 +208,16 @@ def main(seed, episodes, run):
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 
     rewards_df = pd.DataFrame({f'Agent {i + 1}': rewards_per_agent[i] for i in range(agents_count)})
-    rewards_df.to_csv(f'results/rewards_per_agent_Lunar_PPO_NoFed_{run}_{timestamp}.csv', index=False)
+    rewards_df.to_csv(f'rewards_per_agent_Lunar_PPO_NoFed_{run}_{timestamp}.csv', index=False)
 
     avg_df = pd.DataFrame({'Episode': range(1, episodes + 1), 'Average Reward': average_rewards})
-    avg_df.to_csv(f'results/rewards_Lunar_PPO_NoFed_{run}_{timestamp}.csv', index=False)
+    avg_df.to_csv(f'rewards_Lunar_PPO_NoFed_{run}_{timestamp}.csv', index=False)
 
 
 if __name__ == "__main__":
     for run in range(3):
         print(f"\nRun {run + 1}:")
         seed     = 20 + run * 5
-        episodes = 30
+        episodes = 3000
         print(f"Seed: {seed}, Episodes: {episodes}")
         main(seed, episodes, run)
