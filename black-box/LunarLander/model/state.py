@@ -1,4 +1,4 @@
-import gym
+import gymnasium as gym
 import numpy as np
 import torch
 from datetime import datetime
@@ -17,7 +17,7 @@ def load_model(model_path, state_size, action_size, hidden_sizes, activation_fn)
 def test_model(env, model, seed):
     np.random.seed(seed)
     torch.manual_seed(seed)
-    env.seed(seed)
+    # env.seed(seed)  # Deprecated in gym v0.26+, use reset(seed=...) instead
 
     states = []
     state = torch.FloatTensor(env.reset()).unsqueeze(0).to(device)
@@ -40,7 +40,7 @@ def test_model(env, model, seed):
 
 
 def main():
-    env = gym.make('LunarLander-v2')
+    env = gym.make('LunarLander-v3')
     state_size = env.observation_space.shape[0]
     action_size = env.action_space.n
     hidden_sizes = [256, 256]

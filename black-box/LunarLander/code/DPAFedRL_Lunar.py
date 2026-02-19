@@ -1,4 +1,4 @@
-import gym
+import gymnasium as gym
 import numpy as np
 import torch
 import torch.optim as optim
@@ -30,7 +30,8 @@ class Agent:
         self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=100, gamma=0.95)
 
     def train_reinforce(self):
-        state = torch.FloatTensor(self.env.reset()).unsqueeze(0).to(device)
+        obs, _ = self.env.reset()
+        state = torch.FloatTensor(obs).unsqueeze(0).to(device)
         log_probs = []
         rewards = []
         done = False
@@ -39,7 +40,8 @@ class Agent:
             probs = self.policy(state)
             dist = Categorical(probs)
             action = dist.sample()
-            next_state, reward, done, _ = self.env.step(action.item())
+            next_state, reward, terminated, truncated, _ = self.env.step(action.item())
+            done = terminated or truncated
             state = torch.FloatTensor(next_state).unsqueeze(0).to(device)
 
             log_probs.append(dist.log_prob(action))
@@ -82,7 +84,8 @@ class ServerAgent:
         self.env = env
         self.device = device
         self.policy = PolicyNetwork(state_size, action_size, hidden_sizes, activation_fn).to(self.device)
-        self.state = torch.FloatTensor(self.env.reset()).unsqueeze(0).to(device)
+        self.obs, _ = self.env.reset()
+        state = torch.FloatTensor(obs).unsqueeze(0).to(device)
 
     def select_action_and_update_state(self, agents):
         print(self.state)
@@ -98,12 +101,12 @@ class ServerAgent:
 def main(seed, episodes, distill_interval):
     seeds = [seed] * 10
     agents_count = 10
-    envs = [gym.make('LunarLander-v2') for _ in range(agents_count)]
+    envs = [gym.make('LunarLander-v3') for _ in range(agents_count)]
     for i, env in enumerate(envs):
         seed = seeds[i]
         np.random.seed(seed)
         torch.manual_seed(seed)
-        env.seed(seed)
+        # env.seed(seed)  # Deprecated in gym v0.26+, use reset(seed=...) instead
 
     state_size = envs[0].observation_space.shape[0]
     action_size = envs[0].action_space.n
@@ -120,7 +123,7 @@ def main(seed, episodes, distill_interval):
               in range(agents_count)]
 
     # Server Agent setup
-    server_env = gym.make('LunarLander-v2')
+    server_env = gym.make('LunarLander-v3')
     server_agent = ServerAgent(server_env, state_size, action_size, hidden_sizes_list[0], activaton_list[0], device)
 
     rewards_per_agent = [[] for _ in range(agents_count)]

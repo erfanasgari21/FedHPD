@@ -1,4 +1,4 @@
-import gym
+import gymnasium as gym
 import numpy as np
 import torch
 import torch.optim as optim
@@ -17,7 +17,8 @@ class Agent:
         self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=100, gamma=0.95)
 
     def train_reinforce(self):
-        state = torch.FloatTensor(self.env.reset()).unsqueeze(0).to(self.device)
+        obs, _ = self.env.reset()
+        state = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
         log_probs = []
         rewards = []
         done = False
@@ -26,7 +27,8 @@ class Agent:
             probs = self.policy(state)
             dist = Categorical(probs)
             action = dist.sample()
-            next_state, reward, done, _ = self.env.step(action.item())
+            next_state, reward, terminated, truncated, _ = self.env.step(action.item())
+            done = terminated or truncated
             state = torch.FloatTensor(next_state).unsqueeze(0).to(self.device)
 
             log_probs.append(dist.log_prob(action))
@@ -56,10 +58,10 @@ class Agent:
 
 def main(seed, episodes):
     # Environment setup
-    env = gym.make('LunarLander-v2')
+    env = gym.make('LunarLander-v3')
     np.random.seed(seed)
     torch.manual_seed(seed)
-    env.seed(seed)
+    # env.seed(seed)  # Deprecated in gym v0.26+, use reset(seed=...) instead
 
     state_size = env.observation_space.shape[0]
     action_size = env.action_space.n
