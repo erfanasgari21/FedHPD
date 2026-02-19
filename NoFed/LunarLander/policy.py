@@ -61,3 +61,48 @@ class GaussianPolicyNetwork(nn.Module):
 
         return mean, std
 
+
+
+class PPOActorCriticNetwork(nn.Module):
+    """Shared base network with separate Actor (policy) and Critic (value) heads"""
+    
+    def __init__(self, state_size, action_size, hidden_sizes, activation_fn='relu'):
+        super(PPOActorCriticNetwork, self).__init__()
+        
+        # Shared base network
+        self.shared_layers = nn.ModuleList()
+        prev_size = state_size
+        
+        for hidden_size in hidden_sizes:
+            self.shared_layers.append(nn.Linear(prev_size, hidden_size))
+            prev_size = hidden_size
+        
+        # Actor head (policy)
+        self.actor_head = nn.Linear(prev_size, action_size)
+        
+        # Critic head (value function)
+        self.critic_head = nn.Linear(prev_size, 1)
+        
+        # Activation function
+        if activation_fn == 'relu':
+            self.activation = F.relu
+        elif activation_fn == 'tanh':
+            self.activation = torch.tanh
+        else:
+            self.activation = F.relu
+    
+    def forward(self, state):
+        """Forward pass through shared layers and both heads"""
+        x = state
+        for layer in self.shared_layers:
+            x = self.activation(layer(x))
+        
+        # Actor and Critic outputs
+        action_probs = F.softmax(self.actor_head(x), dim=-1)
+        value = self.critic_head(x)
+        
+        return action_probs, value
+    
+    def get_action_and_value(self, state):
+        """Get action probabilities and value estimation"""
+        return self.forward(state)
