@@ -191,7 +191,7 @@ def main(seed, episodes, distill_interval, run):
     average_rewards   = []
     kd_losses         = {f'Agent {i + 1}': [] for i in range(agents_count)}
 
-    pbar = tqdm(range(episodes), desc="Training", unit="ep")
+    pbar = tqdm(range(episodes), unit="ep")
     for episode in range(episodes):
 
         # ── Parallel PPO training via ThreadPoolExecutor ──────────────────────
@@ -267,10 +267,10 @@ def main(seed, episodes, distill_interval, run):
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 
     rewards_df = pd.DataFrame({f'Agent {i + 1}': rewards_per_agent[i] for i in range(agents_count)})
-    rewards_df.to_csv(f'rewards_per_agent_Lunar_PPO_{run}_{timestamp}.csv', index=False)
+    rewards_df.to_csv(f'results/rewards_per_agent_Lunar_PPO_{run}_{timestamp}.csv', index=False)
 
     avg_df = pd.DataFrame({'Episode': range(1, episodes + 1), 'Average Reward': average_rewards})
-    avg_df.to_csv(f'rewards_Lunar_PPO_{run}_{timestamp}.csv', index=False)
+    avg_df.to_csv(f'results/rewards_Lunar_PPO_{run}_{timestamp}.csv', index=False)
 
 
 if __name__ == "__main__":

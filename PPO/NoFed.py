@@ -128,7 +128,7 @@ def main(seed, episodes, run):
     rewards_per_agent = [[] for _ in range(agents_count)]
     average_rewards   = []
 
-    pbar = tqdm(range(episodes), desc=f"Seed {seed}", unit="ep")
+    pbar = tqdm(range(episodes), unit="ep")
     for episode in pbar:
 
         with ThreadPoolExecutor(max_workers=agents_count) as executor:
@@ -159,16 +159,16 @@ def main(seed, episodes, run):
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 
     rewards_df = pd.DataFrame({f'Agent {i + 1}': rewards_per_agent[i] for i in range(agents_count)})
-    rewards_df.to_csv(f'rewards_per_agent_Lunar_PPO_NoFed_{run}_{timestamp}.csv', index=False)
+    rewards_df.to_csv(f'results/rewards_per_agent_Lunar_PPO_NoFed_{run}_{timestamp}.csv', index=False)
 
     avg_df = pd.DataFrame({'Episode': range(1, episodes + 1), 'Average Reward': average_rewards})
-    avg_df.to_csv(f'rewards_Lunar_PPO_NoFed_{run}_{timestamp}.csv', index=False)
+    avg_df.to_csv(f'results/rewards_Lunar_PPO_NoFed_{run}_{timestamp}.csv', index=False)
 
 
 if __name__ == "__main__":
     for run in range(3):
         print(f"\nRun {run + 1}:")
         seed     = 20 + run * 5
-        episodes = 3000
+        episodes = 30
         print(f"Seed: {seed}, Episodes: {episodes}")
         main(seed, episodes, run)
