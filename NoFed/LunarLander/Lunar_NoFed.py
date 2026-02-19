@@ -210,13 +210,14 @@ def main(seed, episodes, distill_interval):
                 last_100_avg = sum(rewards_per_agent[idx][-100:]) / 100
             else:
                 last_100_avg = sum(rewards_per_agent[idx]) / len(rewards_per_agent[idx])
-            print(f"  Agent {idx + 1} Reward: {reward} | Average Reward: {last_100_avg:.4f}")
+            #print(f"  Agent {idx + 1} Reward: {reward} | Average Reward: {last_100_avg:.4f}")
 
         print(f"  Average Reward: {average_reward}")
 
         if (episode + 1) % distill_interval == 0:
             csv_file = 'KD_state_10-from-each.csv'
             df = pd.read_csv(csv_file)
+            print("kd state 10 from each", len(df))
             sampled_states = df['State'].apply(lambda x: torch.tensor([float(i) for i in x.split(',')]))
             sampled_states = torch.stack(sampled_states.values.tolist()).to(device)
 
