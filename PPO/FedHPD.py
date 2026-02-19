@@ -160,6 +160,7 @@ def main(seed, episodes, distill_interval, run):
     for i, env in enumerate(envs):
         np.random.seed(seeds[i])
         torch.manual_seed(seeds[i])
+        env.reset(seed=seeds[i])
 
     state_size  = envs[0].observation_space.shape[0]
     action_size = envs[0].action_space.n
