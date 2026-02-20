@@ -1,4 +1,4 @@
-
+from torch.utils.tensorboard import SummaryWriter
 
 import numpy as np
 import torch
@@ -74,23 +74,34 @@ class Agent:
 
 
     def select_action(self, state):
-        state = torch.tensor(state, dtype=torch.float32).to(self.device)
+      state = torch.tensor(state, dtype=torch.float32, device=self.device)
 
-        with torch.no_grad():
+      with torch.no_grad():
+          action, log_prob, value = self.model.act(state)
 
-            action, log_prob, value = self.model.act(state)
-
-            action = action.cpu().numpy()
-
-            return action, log_prob.item(), value.item()
+      action = int(action.cpu().item())  # ✅ اکشن گسسته باید int باشد
+      return action, float(log_prob.item()), float(value.item())
 
 
     def update(self):
         states        = torch.tensor(np.array(self.buffer.states),  dtype=torch.float32).to(self.device)
-        actions       = torch.tensor(np.array(self.buffer.actions), dtype=torch.long).to(self.device)
+        actions = torch.tensor(self.buffer.actions, dtype=torch.long, device=self.device)
         old_log_probs = torch.tensor(self.buffer.log_probs,         dtype=torch.float32).to(self.device)
 
-        returns, advantages = self.buffer.compute_returns_and_advantages(self.gamma, self.gae_lambda)
+        # ---- 1) محاسبه last_value برای bootstrap ----
+        last_done = self.buffer.dones[-1]
+        if last_done:
+            last_value = 0.0
+        else:
+            with torch.no_grad():
+                s = torch.tensor(self.state, dtype=torch.float32, device=self.device)
+                _, v = self.model.forward(s)
+                last_value = v.item()
+
+        # ---- 2) حالا GAE درست محاسبه میشه ----
+        returns, advantages = self.buffer.compute_returns_and_advantages(
+            self.gamma, self.gae_lambda, last_value
+        )
         returns = returns.to(self.device)
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         advantages = advantages.to(self.device)
@@ -201,7 +212,7 @@ class Agent:
 
 def main(seed, num_updates, run):
     agents_count = 2
-    seeds        = [seed] * agents_count
+    seeds = [seed + i*1000 for i in range(agents_count)]
     envs         = [gym.make('LunarLander-v3') for _ in range(agents_count)]
     for i, env in enumerate(envs):
         np.random.seed(seeds[i])
@@ -211,8 +222,8 @@ def main(seed, num_updates, run):
     state_size  = envs[0].observation_space.shape[0]
     action_size = envs[0].action_space.n
 
-    lr_list = [5e-4, 1e-3, 4e-4, 6e-4, 3e-4,
-               4e-4, 5e-4, 1e-3, 2e-4, 1e-4]
+    lr_list = [1e-4, 1e-4, 1e-4, 1e-4, 3e-4,
+               4e-4, 5e-4, 1e-4, 2e-4, 1e-4]
     activation_list = ['relu', 'relu', 'tanh', 'relu', 'tanh',
                        'relu', 'tanh', 'relu', 'tanh', 'relu']
     gamma = 0.99
@@ -231,7 +242,8 @@ def main(seed, num_updates, run):
                 activation_list[i % len(activation_list)]
             ),
             lr_list[i % len(lr_list)],
-            gamma
+            gamma,
+            entropy_coef=0.01,
         )
         for i in range(agents_count)
     ]
@@ -239,6 +251,13 @@ def main(seed, num_updates, run):
     all_rewards = [[] for _ in range(agents_count)] 
     all_terminal_steps = [[] for _ in range(agents_count)] 
 
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_file = open(f"training_log_WoFed_{timestamp}.txt", "w")
+    log_file.write("Update,Timestep,Rolling_Avg_Reward\n") # نوشتن هدر
+
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    writer = SummaryWriter(log_dir=f"runs/WoFed_{timestamp}")
+    
     pbar = tqdm(range(num_updates), unit="update")
     for T in pbar:
         
@@ -268,6 +287,18 @@ def main(seed, num_updates, run):
             "timestep":    timestep,
             "rolling_100": f"{avg_rolling:.2f}"
         })
+        
+        
+        # --- اضافه کردن این دو خط برای ذخیره آنی لاگ ---
+        log_file.write(f"{T},{timestep},{avg_rolling:.2f}\n")
+        log_file.flush()  # این دستور باعث می‌شود اطلاعات فوراً در فایل ذخیره شود
+
+        # ارسال میانگین پاداش کل سیستم به تنسوربورد
+        writer.add_scalar("Reward/System_Average", avg_rolling, timestep)
+        
+        # ارسال پاداش هر ایجنت به صورت جداگانه
+        for i in range(agents_count):
+            writer.add_scalar(f"Reward/Agent_{i+1}", rolling_avgs[i], timestep)
 
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 
@@ -277,6 +308,10 @@ def main(seed, num_updates, run):
         f'Agent {i+1}': all_rewards[i] + [np.nan] * (max_len - len(all_rewards[i]))
         for i in range(agents_count)
     })
+    log_file.close()
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    writer = SummaryWriter(log_dir=f"runs/WoFed_{timestamp}")
+    
     rewards_df.to_csv(f'rewards_per_agent_Lunar_PPO_NoFed_{run}_{timestamp}.csv', index=False)
 
 
