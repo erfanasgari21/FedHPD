@@ -68,7 +68,6 @@ class RolloutBuffer:
     def __len__(self):
         return len(self.rewards)
 
-
 class Agent:
     def __init__(self, env, state_size, action_size, hidden_sizes, lr, activation_fn, gamma, device):
         self.env       = env
@@ -76,8 +75,27 @@ class Agent:
         self.device    = device
         self.policy    = PPOActorCriticNetwork(state_size, action_size, hidden_sizes, activation_fn).to(self.device)
         self.optimizer = optim.Adam(self.policy.parameters(), lr=lr)
-        self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=100, gamma=0.95)
         self.buffer    = RolloutBuffer()
+        # Persistent state across calls
+        self.state, _  = env.reset()
+        self.ep_reward = 0.0
+        self.completed_episode_rewards = []
+
+    def collect_rollout(self, rollout_length):
+        """Collect exactly rollout_length steps, spanning episode boundaries."""
+        for _ in range(rollout_length):
+            action, log_prob, value = self.select_action(self.state)
+            next_state, reward, terminated, truncated, _ = self.env.step(action)
+            done = terminated or truncated
+
+            self.buffer.add(self.state, action, log_prob, reward, done, value)
+            self.state     = next_state
+            self.ep_reward += reward
+
+            if done:
+                self.completed_episode_rewards.append(self.ep_reward)
+                self.ep_reward = 0.0
+                self.state, _ = self.env.reset()
 
     def select_action(self, state):
         state_t = torch.tensor(state, dtype=torch.float32).to(self.device)
@@ -102,10 +120,7 @@ class Agent:
             np.random.shuffle(indices)
             for start in range(0, dataset_size, BATCH_SIZE):
                 batch_idx = indices[start: start + BATCH_SIZE]
-
-                log_probs, entropy, values = self.policy.evaluate(
-                    states[batch_idx], actions[batch_idx]
-                )
+                log_probs, entropy, values = self.policy.evaluate(states[batch_idx], actions[batch_idx])
 
                 ratio  = torch.exp(log_probs - old_log_probs[batch_idx])
                 surr1  = ratio * advantages[batch_idx]
@@ -114,8 +129,7 @@ class Agent:
                 policy_loss  = -torch.min(surr1, surr2).mean()
                 value_loss   = (returns[batch_idx] - values).pow(2).mean()
                 entropy_loss = entropy.mean()
-
-                loss = policy_loss + VALUE_COEF * value_loss - ENTROPY_COEF * entropy_loss
+                loss         = policy_loss + VALUE_COEF * value_loss - ENTROPY_COEF * entropy_loss
 
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -124,31 +138,7 @@ class Agent:
 
         self.buffer.clear()
 
-    def run_episode(self):
-        state, _  = self.env.reset()
-        ep_reward = 0
-        done      = False
-
-        while not done:
-            action, log_prob, value = self.select_action(state)
-            next_state, reward, terminated, truncated, _ = self.env.step(action)
-            done = terminated or truncated
-
-            self.buffer.add(state, action, log_prob, reward, done, value)
-            state      = next_state
-            ep_reward += reward
-
-            if len(self.buffer) >= ROLLOUT_LENGTH:
-                self.update()
-
-        if len(self.buffer) > 0:
-            self.update()
-
-        self.scheduler.step()
-        return ep_reward
-
-
-def main(seed, episodes, run):
+def main(seed, total_timesteps, run):
     seeds        = [seed] * 2
     agents_count = 2
     envs         = [gym.make('LunarLander-v3') for _ in range(agents_count)]
@@ -180,50 +170,61 @@ def main(seed, episodes, run):
         for i in range(agents_count)
     ]
 
+    
+    num_updates = total_timesteps // ROLLOUT_LENGTH
+    all_rewards = [[] for _ in range(agents_count)]  # per completed episode
+
+
     rewards_per_agent = [[] for _ in range(agents_count)]
     average_rewards   = []
 
-    pbar = tqdm(range(episodes), desc=f"Seed {seed}", unit="ep")
-    for episode in pbar:
+    
+    pbar = tqdm(range(num_updates), unit="update")
+    for update in pbar:
 
+        # Collect rollouts in parallel
         with ThreadPoolExecutor(max_workers=agents_count) as executor:
-            total_rewards = list(executor.map(lambda a: a.run_episode(), agents))
+            executor.map(lambda a: a.collect_rollout(ROLLOUT_LENGTH), agents)
 
-        for i, reward in enumerate(total_rewards):
-            rewards_per_agent[i].append(reward)
+        # Update all agents
+        for agent in agents:
+            agent.update()
 
-        average_reward = sum(total_rewards) / len(total_rewards)
-        average_rewards.append(average_reward)
+        # Gather any completed episodes this rollout
+        for i, agent in enumerate(agents):
+            all_rewards[i].extend(agent.completed_episode_rewards)
+            agent.completed_episode_rewards = []
 
-        rolling_avg = sum(
-            sum(rewards_per_agent[i][-100:]) / len(rewards_per_agent[i][-100:])
-            for i in range(agents_count)
-        ) / agents_count
+        # Rolling average over last 100 completed episodes per agent
+        rolling_avgs = []
+        for i in range(agents_count):
+            window = all_rewards[i][-100:] if all_rewards[i] else [0]
+            rolling_avgs.append(sum(window) / len(window))
+
+        avg_rolling = sum(rolling_avgs) / agents_count
+        timestep    = (update + 1) * ROLLOUT_LENGTH
 
         pbar.set_postfix({
-            "avg_reward":  f"{average_reward:.2f}",
-            "rolling_100": f"{rolling_avg:.2f}"
+            "timestep":    timestep,
+            "rolling_100": f"{avg_rolling:.2f}"
         })
-
-        # Per-agent logging (commented out)
-        # for idx, reward in enumerate(total_rewards):
-        #     window   = rewards_per_agent[idx][-100:]
-        #     last_avg = sum(window) / len(window)
-        #     print(f"  Agent {idx + 1} Reward: {reward:.2f} | Avg(100): {last_avg:.4f}")
 
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 
-    rewards_df = pd.DataFrame({f'Agent {i + 1}': rewards_per_agent[i] for i in range(agents_count)})
+    # Pad to same length for DataFrame
+    max_len    = max(len(r) for r in all_rewards)
+    rewards_df = pd.DataFrame({
+        f'Agent {i+1}': all_rewards[i] + [np.nan] * (max_len - len(all_rewards[i]))
+        for i in range(agents_count)
+    })
     rewards_df.to_csv(f'rewards_per_agent_Lunar_PPO_NoFed_{run}_{timestamp}.csv', index=False)
-
-    avg_df = pd.DataFrame({'Episode': range(1, episodes + 1), 'Average Reward': average_rewards})
-    avg_df.to_csv(f'rewards_Lunar_PPO_NoFed_{run}_{timestamp}.csv', index=False)
 
 
 if __name__ == "__main__":
     for run in range(1):
         print(f"\nRun {run + 1}:")
-        seed     = 20 + run * 5
-        episodes = 5000
-        print(f"Seed: {seed}, Episodes: {episodes}")
-        main(seed, episodes, run)
+        seed           = 20 + run * 5
+        total_timesteps = 5000 * 2048  
+        print(f"Seed: {seed}")
+        main(seed, total_timesteps, run)
+
