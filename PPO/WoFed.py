@@ -198,7 +198,7 @@ def ppo_train(
     return logger
 
 
-def main(seed, total_timesteps, run):
+def main(seed, num_updates, run):
     agents_count = 2
     seeds        = [seed] * agents_count
     envs         = [gym.make('LunarLander-v3') for _ in range(agents_count)]
@@ -221,8 +221,6 @@ def main(seed, total_timesteps, run):
 
     state_size, action_size,
             
-            
-
     agents = [
         Agent(
             envs[i], 
@@ -237,12 +235,15 @@ def main(seed, total_timesteps, run):
         for i in range(agents_count)
     ]
 
+    all_rewards = [[] for _ in range(agents_count)] 
+    all_terminal_steps = [[] for _ in range(agents_count)] 
+
     pbar = tqdm(range(num_updates), unit="update")
     for T in enumerate(pbar):
         
         # Collect rollouts in parallel
         with ThreadPoolExecutor(max_workers=agents_count) as executor:
-            executor.map(lambda a: a.collect_rollout(ROLLOUT_LENGTH), agents)
+            executor.map(lambda a: a.collect_rollout(T, ROLLOUT_LENGTH), agents)
         
         # Update all agents
         for agent in agents:
@@ -252,6 +253,7 @@ def main(seed, total_timesteps, run):
         for i, agent in enumerate(agents):
             all_rewards[i].extend(agent.rewards)
             all_terminal_steps[i].extend(agent.terminal_steps)
+            agent.rewards, agent.terminal_steps = [], []
         
         rolling_avgs = []
         for i in range(agents_count):
@@ -261,46 +263,28 @@ def main(seed, total_timesteps, run):
         avg_rolling = sum(rolling_avgs) / agents_count
         timestep    = (T + 1) * self.rollout_length
 
+        pbar.set_postfix({
+            "timestep":    timestep,
+            "rolling_100": f"{avg_rolling:.2f}"
+        })
 
-if __name__ == "__main__":
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 
-    set_seed(42)
+    # Pad to same length for DataFrame
+    max_len    = max(len(r) for r in all_rewards)
+    rewards_df = pd.DataFrame({
+        f'Agent {i+1}': all_rewards[i] + [np.nan] * (max_len - len(all_rewards[i]))
+        for i in range(agents_count)
+    })
+    rewards_df.to_csv(f'rewards_per_agent_Lunar_PPO_NoFed_{run}_{timestamp}.csv', index=False)
 
-    env = gym.make(
-        "LunarLander-v3",
-        continuous=False,
-        enable_wind=False,
-    )
-
-    state_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.n
-
-    model = DiscreteActorCritic(
-        state_dim,
-        action_dim
-    )
-
-    agent = PPOAgent(
-        model,
-        device="cpu",
-    )
-
-    logger = train_ppo(
-        env,
-        agent,
-        run_id="scratch_discrete",
-        env_id="LunarLander-v3",
-        continuous=False,
-        total_timesteps=600_000,
-        rollout_length=2048,
-    )
 
 
 if __name__ == "__main__":
     for run in range(1):
         print(f"\nRun {run + 1}:")
-        seed           = 20 + run * 5
-        total_timesteps = 5000 * 2048  
+        seed  = 20 + run * 5
+        num_updates=500 
         print(f"Seed: {seed}")
-        main(seed, total_timesteps, run)
+        main(seed, num_updates, run)
 
