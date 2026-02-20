@@ -36,20 +36,26 @@ class RolloutBuffer:
         self.values.append(value)
 
     def compute_returns_and_advantages(self, gamma, gae_lambda):
+        returns    = []
         advantages = []
         gae        = 0
         next_value = 0
 
         for t in reversed(range(len(self.rewards))):
-            mask       = 1.0 - float(self.dones[t])
-            delta      = self.rewards[t] + gamma * next_value * mask - self.values[t]
-            gae        = delta + gamma * gae_lambda * mask * gae
+            delta = (
+                self.rewards[t]
+                + gamma * next_value * (1 - float(self.dones[t]))
+                - self.values[t]
+            )
+            gae = delta + gamma * gae_lambda * (1 - float(self.dones[t])) * gae
             advantages.insert(0, gae)
+            returns.insert(0, gae + self.values[t])   # <-- FIX: compute inline
             next_value = self.values[t]
 
-        advantages = torch.tensor(advantages, dtype=torch.float32)
-        returns    = advantages + torch.tensor(self.values, dtype=torch.float32)
-        return returns, advantages
+        return (
+            torch.tensor(returns,    dtype=torch.float32),
+            torch.tensor(advantages, dtype=torch.float32),
+        )
 
     def clear(self):
         self.states    = []
@@ -143,8 +149,8 @@ class Agent:
 
 
 def main(seed, episodes, run):
-    seeds        = [seed] * 8
-    agents_count = 8
+    seeds        = [seed] * 2
+    agents_count = 2
     envs         = [gym.make('LunarLander-v3') for _ in range(agents_count)]
     for i, env in enumerate(envs):
         np.random.seed(seeds[i])
@@ -215,9 +221,9 @@ def main(seed, episodes, run):
 
 
 if __name__ == "__main__":
-    for run in range(3):
+    for run in range(1):
         print(f"\nRun {run + 1}:")
         seed     = 20 + run * 5
-        episodes = 3000
+        episodes = 5000
         print(f"Seed: {seed}, Episodes: {episodes}")
         main(seed, episodes, run)

@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributions as distributions
+from torch.distributions import Categorical
 
 
 class PolicyNetwork(nn.Module):
@@ -66,16 +67,13 @@ class GaussianPolicyNetwork(nn.Module):
 class PPOActorCriticNetwork(nn.Module):
     def __init__(self, state_size, action_size, hidden_sizes, activation_fn='relu'):
         super(PPOActorCriticNetwork, self).__init__()
-
         self.shared_layers = nn.ModuleList()
         prev_size = state_size
         for hidden_size in hidden_sizes:
             self.shared_layers.append(nn.Linear(prev_size, hidden_size))
             prev_size = hidden_size
-
         self.actor_head  = nn.Linear(prev_size, action_size)
         self.critic_head = nn.Linear(prev_size, 1)
-
         if activation_fn == 'relu':
             self.activation = F.relu
         elif activation_fn == 'tanh':
@@ -90,31 +88,25 @@ class PPOActorCriticNetwork(nn.Module):
         return x
 
     def forward(self, state):
-        x            = self._shared_forward(state)
-        action_probs = F.softmax(self.actor_head(x), dim=-1)
-        value        = self.critic_head(x)
-        return action_probs, value
+        x      = self._shared_forward(state)
+        logits = self.actor_head(x)
+        value  = self.critic_head(x)
+        return logits, value
 
     def act(self, state):
-        """Sample an action — used during rollout (no grad context expected outside)."""
-        x            = self._shared_forward(state)
-        action_probs = F.softmax(self.actor_head(x), dim=-1)
-        value        = self.critic_head(x)
-
-        dist     = Categorical(action_probs)
+        x      = self._shared_forward(state)
+        logits = self.actor_head(x)
+        value  = self.critic_head(x)
+        dist     = Categorical(logits=logits)   # <-- FIX: use logits, not softmax probs
         action   = dist.sample()
         log_prob = dist.log_prob(action)
-
-        return action, log_prob, value.squeeze()
+        return action, log_prob, value.squeeze(-1)
 
     def evaluate(self, states, actions):
-        """Re-evaluate stored actions for PPO update — used with gradients."""
-        x            = self._shared_forward(states)
-        action_probs = F.softmax(self.actor_head(x), dim=-1)
-        values       = self.critic_head(x).squeeze()
-
-        dist      = Categorical(action_probs)
+        x      = self._shared_forward(states)
+        logits = self.actor_head(x)
+        values = self.critic_head(x).squeeze(-1)
+        dist      = Categorical(logits=logits)   # <-- FIX: use logits, not softmax probs
         log_probs = dist.log_prob(actions)
         entropy   = dist.entropy()
-
         return log_probs, entropy, values
