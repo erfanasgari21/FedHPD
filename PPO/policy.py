@@ -97,7 +97,7 @@ class PPOActorCriticNetwork(nn.Module):
         x      = self._shared_forward(state)
         logits = self.actor_head(x)
         value  = self.critic_head(x)
-        dist     = Categorical(logits=logits)   # <-- FIX: use logits, not softmax probs
+        dist     = Categorical(logits=logits)   
         action   = dist.sample()
         log_prob = dist.log_prob(action)
         return action, log_prob, value.squeeze(-1)
@@ -106,7 +106,7 @@ class PPOActorCriticNetwork(nn.Module):
         x      = self._shared_forward(states)
         logits = self.actor_head(x)
         values = self.critic_head(x).squeeze(-1)
-        dist      = Categorical(logits=logits)   # <-- FIX: use logits, not softmax probs
+        dist      = Categorical(logits=logits)   
         log_probs = dist.log_prob(actions)
         entropy   = dist.entropy()
         return log_probs, entropy, values
