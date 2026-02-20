@@ -12,11 +12,6 @@ from gymnasium.wrappers import RecordVideo
 
 from rollout_buffer import RolloutBuffer
 
-          envs[i], state_size, action_size,
-            hidden_sizes_list[i % len(hidden_sizes_list)],
-            lr_list[i % len(lr_list)],
-            activation_list[i % len(activation_list)],
-            gamma, device=device
 
 class Agent:
     def __init__(
@@ -97,7 +92,7 @@ class Agent:
         dataset_size = states.size(0)
         indices = np.arange(dataset_size)
 
-        loss_info = {"policy": [], "value": [], "entropy": []}
+        # loss_info = {"policy": [], "value": [], "entropy": []}
 
         for _ in range(self.epochs):
             np.random.shuffle(indices)
