@@ -12,25 +12,31 @@ from gymnasium.wrappers import RecordVideo
 
 from rollout_buffer import RolloutBuffer
 
-from src.utils.evaluation import record_episode
-
+          envs[i], state_size, action_size,
+            hidden_sizes_list[i % len(hidden_sizes_list)],
+            lr_list[i % len(lr_list)],
+            activation_list[i % len(activation_list)],
+            gamma, device=device
 
 class Agent:
     def __init__(
         self,
+        env,
         model,
         lr=3e-4,
         gamma=0.99,
+        device="cpu",
+        
         gae_lambda=0.95,
         clip_eps=0.2,
         value_coef=0.5,
         entropy_coef=0.0,
         epochs=4,
         batch_size=64,
-        device="cpu",
-        action_low=None,
-        action_high=None
     ):
+
+        self.env = env
+
         self.device = device
         self.model = model.to(device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
@@ -45,8 +51,26 @@ class Agent:
         self.epochs = epochs
         self.batch_size = batch_size
 
-        self.action_low = action_low
-        self.action_high = action_high
+        self.stateو _ = env.reset()
+        self.ep_reward = 0.0
+
+    def collect_rollout(self, T, rollout_length):
+        """Collect exactly rollout_length steps, spanning episode boundaries."""
+        for t in range(rollout_length):
+            action, log_prob, value = self.select_action(self.state)
+            next_state, reward, terminated, truncated, _ = self.env.step(action)
+            done = terminated or truncated
+
+            self.buffer.add(self.state, action, log_prob, reward, done, value)
+            self.state     = next_state
+            self.ep_reward += reward
+
+            if done:
+                self.rewards.append(self.ep_reward)
+                self.terminal_steps.append(T*self.rollout_length + t)
+                self.ep_reward = 0.0
+                self.state, _ = self.env.reset()
+
 
     def select_action(self, state):
         state = torch.tensor(state, dtype=torch.float32).to(self.device)
@@ -61,16 +85,11 @@ class Agent:
 
 
     def update(self):
-        states = torch.tensor(self.buffer.states, dtype=torch.float32).to(self.device)
-        actions = torch.tensor(
-            np.array(self.buffer.actions),
-            dtype=torch.float32
-        ).to(self.device)
-        old_log_probs = torch.tensor(self.buffer.log_probs).to(self.device)
+        states        = torch.tensor(np.array(self.buffer.states),  dtype=torch.float32).to(self.device)
+        actions       = torch.tensor(np.array(self.buffer.actions), dtype=torch.long).to(self.device)
+        old_log_probs = torch.tensor(self.buffer.log_probs,         dtype=torch.float32).to(self.device)
 
-        returns, advantages = self.buffer.compute_returns_and_advantages(
-            self.gamma, self.gae_lambda
-        )
+        returns, advantages = self.buffer.compute_returns_and_advantages(self.gamma, self.gae_lambda)
         returns = returns.to(self.device)
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         advantages = advantages.to(self.device)
@@ -92,48 +111,34 @@ class Agent:
 
                 ratio = torch.exp(log_probs - old_log_probs[batch_idx])
                 surr1 = ratio * advantages[batch_idx]
-                surr2 = torch.clamp(
-                    ratio, 1 - self.clip_eps, 1 + self.clip_eps
-                ) * advantages[batch_idx]
+                surr2 = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * advantages[batch_idx]
 
                 policy_loss = -torch.min(surr1, surr2).mean()
                 value_loss = (returns[batch_idx] - values).pow(2).mean()
                 entropy_loss = entropy.mean()
 
-                loss = (
-                    policy_loss
-                    + self.value_coef * value_loss
-                    - self.entropy_coef * entropy_loss
-                )
+                loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy_loss
 
                 self.optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
                 self.optimizer.step()
 
-                loss_info["policy"].append(policy_loss.item())
-                loss_info["value"].append(value_loss.item())
-                loss_info["entropy"].append(entropy_loss.item())
+                # loss_info["policy"].append(policy_loss.item())
+                # loss_info["value"].append(value_loss.item())
+                # loss_info["entropy"].append(entropy_loss.item())
 
         self.buffer.clear()
         return loss_info
 
 
-class ScratchLogger:
-    def __init__(self):
-        self.rewards = []
-        self.terminal_steps = []
-        self.policy_losses = []
-        self.value_losses = []
-        self.loss_steps = []
 
-
-def train_ppo(
+def ppo_train(
     env,
     agent,
     run_id,
     total_timesteps=600_000,
-    rollout_length=2048,
+    rollout_length=1024,
     log_interval=100,
     record_every=100_000,
     env_id="LunarLander-v3",
@@ -143,15 +148,11 @@ def train_ppo(
 
     logger = ScratchLogger()
 
-    state, _ = env.reset()
     ep_reward = 0
     episode = 0
 
     reward_window = deque(maxlen=100)
 
-    os.makedirs(video_folder, exist_ok=True)
-
-    next_record_step = record_every
 
     for t in range(1, total_timesteps + 1):
 
@@ -193,29 +194,72 @@ def train_ppo(
             logger.value_losses.append(np.mean(loss_info["value"]))
             logger.loss_steps.append(t)
 
-        # -------- VIDEO RECORD (TIMESTEP BASED) --------
-        if t >= next_record_step:
-            print(f"Recording evaluation at timestep {t}")
-
-            eval_env = gym.make(
-                env_id,
-                continuous=continuous,
-                render_mode="rgb_array"
-            )
-
-            eval_env = RecordVideo(
-                eval_env,
-                video_folder=video_folder,
-                episode_trigger=lambda x: True,
-                name_prefix=f"{run_id}_step{t}"
-            )
-
-            record_episode(agent, eval_env)
-            eval_env.close()
-
-            next_record_step += record_every
 
     return logger
+
+
+def main(seed, total_timesteps, run):
+    agents_count = 2
+    seeds        = [seed] * agents_count
+    envs         = [gym.make('LunarLander-v3') for _ in range(agents_count)]
+    for i, env in enumerate(envs):
+        np.random.seed(seeds[i])
+        torch.manual_seed(seeds[i])
+        env.reset(seed=seeds[i])
+
+    state_size  = envs[0].observation_space.shape[0]
+    action_size = envs[0].action_space.n
+
+    lr_list = [5e-4, 1e-3, 4e-4, 6e-4, 3e-4,
+               4e-4, 5e-4, 1e-3, 2e-4, 1e-4]
+    activation_list = ['relu', 'relu', 'tanh', 'relu', 'tanh',
+                       'relu', 'tanh', 'relu', 'tanh', 'relu']
+    gamma = 0.99
+
+    hidden_sizes_list = [[128, 128, 256], [64, 64], [128, 128], [128, 256], [256, 256],
+                         [512], [64, 128, 64], [32, 32], [512, 512], [1024]]
+
+    state_size, action_size,
+            
+            
+
+    agents = [
+        Agent(
+            envs[i], 
+            PPOActorCriticNetwork( 
+                state_size, action_size, 
+                hidden_sizes_list[i % len(hidden_sizes_list)], 
+                activation_list[i % len(activation_list)]
+            ).to(self.device),
+            lr_list[i % len(lr_list)],
+            gamma, device=device
+        )
+        for i in range(agents_count)
+    ]
+
+    pbar = tqdm(range(num_updates), unit="update")
+    for T in enumerate(pbar):
+        
+        # Collect rollouts in parallel
+        with ThreadPoolExecutor(max_workers=agents_count) as executor:
+            executor.map(lambda a: a.collect_rollout(ROLLOUT_LENGTH), agents)
+        
+        # Update all agents
+        for agent in agents:
+            agent.update()
+
+        # Gather any completed episodes this rollout
+        for i, agent in enumerate(agents):
+            all_rewards[i].extend(agent.rewards)
+            all_terminal_steps[i].extend(agent.terminal_steps)
+        
+        rolling_avgs = []
+        for i in range(agents_count):
+            window = all_rewards[i][-10:] if all_rewards[i] else [0]
+            rolling_avgs.append(sum(window) / len(window))
+
+        avg_rolling = sum(rolling_avgs) / agents_count
+        timestep    = (T + 1) * self.rollout_length
 
 
 if __name__ == "__main__":
@@ -251,6 +295,12 @@ if __name__ == "__main__":
         rollout_length=2048,
     )
 
-    plot_results(logger, title="From Scratch PPO - Discrete - Wind disabled")
 
-    env.close()
+if __name__ == "__main__":
+    for run in range(1):
+        print(f"\nRun {run + 1}:")
+        seed           = 20 + run * 5
+        total_timesteps = 5000 * 2048  
+        print(f"Seed: {seed}")
+        main(seed, total_timesteps, run)
+

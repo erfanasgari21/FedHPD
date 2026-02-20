@@ -65,48 +65,44 @@ class GaussianPolicyNetwork(nn.Module):
 
 
 class PPOActorCriticNetwork(nn.Module):
-    def __init__(self, state_size, action_size, hidden_sizes, activation_fn='relu'):
-        super(PPOActorCriticNetwork, self).__init__()
-        self.shared_layers = nn.ModuleList()
+        def __init__(self, state_size, action_size, hidden_sizes, activation_fn='relu'):
+        super().__init__()
+
+        if activation_fn == 'tanh':
+            activation = nn.Tanh
+        else:
+            activation = nn.ReLU
+
+        layers = []
         prev_size = state_size
         for hidden_size in hidden_sizes:
-            self.shared_layers.append(nn.Linear(prev_size, hidden_size))
+            layers.append(nn.Linear(prev_size, hidden_size))
+            layers.append(activation())
             prev_size = hidden_size
+
+        self.shared = nn.Sequential(*layers)
+
         self.actor_head  = nn.Linear(prev_size, action_size)
         self.critic_head = nn.Linear(prev_size, 1)
-        if activation_fn == 'relu':
-            self.activation = F.relu
-        elif activation_fn == 'tanh':
-            self.activation = torch.tanh
-        else:
-            self.activation = F.relu
 
-    def _shared_forward(self, state):
-        x = state
-        for layer in self.shared_layers:
-            x = self.activation(layer(x))
-        return x
 
     def forward(self, state):
-        x      = self._shared_forward(state)
+        x      = self.shared(state)
         logits = self.actor_head(x)
         value  = self.critic_head(x)
         return logits, value
 
     def act(self, state):
-        x      = self._shared_forward(state)
-        logits = self.actor_head(x)
-        value  = self.critic_head(x)
+        logits, value = self.forward(state)
         dist     = Categorical(logits=logits)   
         action   = dist.sample()
         log_prob = dist.log_prob(action)
         return action, log_prob, value.squeeze(-1)
 
     def evaluate(self, states, actions):
-        x      = self._shared_forward(states)
-        logits = self.actor_head(x)
-        values = self.critic_head(x).squeeze(-1)
-        dist      = Categorical(logits=logits)   
+        logits, value = self.forward(state)
+        dist      = Categorical(logits=logits) 
+
         log_probs = dist.log_prob(actions)
         entropy   = dist.entropy()
-        return log_probs, entropy, values
+        return log_probs, entropy, values.squeeze(-1)
