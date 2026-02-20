@@ -65,7 +65,7 @@ class GaussianPolicyNetwork(nn.Module):
 
 
 class PPOActorCriticNetwork(nn.Module):
-        def __init__(self, state_size, action_size, hidden_sizes, activation_fn='relu'):
+    def __init__(self, state_size, action_size, hidden_sizes, activation_fn='relu'):
         super().__init__()
 
         if activation_fn == 'tanh':
@@ -100,9 +100,8 @@ class PPOActorCriticNetwork(nn.Module):
         return action, log_prob, value.squeeze(-1)
 
     def evaluate(self, states, actions):
-        logits, value = self.forward(state)
+        logits, values = self.forward(states)
         dist      = Categorical(logits=logits) 
-
         log_probs = dist.log_prob(actions)
         entropy   = dist.entropy()
         return log_probs, entropy, values.squeeze(-1)

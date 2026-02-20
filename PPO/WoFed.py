@@ -6,12 +6,16 @@ import torch.optim as optim
 import torch.nn as nn
 import os
 import gymnasium as gym
+from tqdm import tqdm
+from datetime import datetime
+import pandas as pd
 
 from collections import deque
 from gymnasium.wrappers import RecordVideo
 
+from policy import PPOActorCriticNetwork
 from rollout_buffer import RolloutBuffer
-
+from concurrent.futures import ThreadPoolExecutor
 
 class Agent:
     def __init__(
@@ -46,8 +50,10 @@ class Agent:
         self.epochs = epochs
         self.batch_size = batch_size
 
-        self.stateو _ = env.reset()
+        self.state, _ = env.reset()
         self.ep_reward = 0.0
+        self.rewards = []
+        self.terminal_steps = []
 
     def collect_rollout(self, T, rollout_length):
         """Collect exactly rollout_length steps, spanning episode boundaries."""
@@ -62,7 +68,7 @@ class Agent:
 
             if done:
                 self.rewards.append(self.ep_reward)
-                self.terminal_steps.append(T*self.rollout_length + t)
+                self.terminal_steps.append(T*rollout_length + t)
                 self.ep_reward = 0.0
                 self.state, _ = self.env.reset()
 
@@ -76,7 +82,7 @@ class Agent:
 
             action = action.cpu().numpy()
 
-            return action, log_prob.item(), value.item(), action
+            return action, log_prob.item(), value.item()
 
 
     def update(self):
@@ -124,73 +130,73 @@ class Agent:
                 # loss_info["entropy"].append(entropy_loss.item())
 
         self.buffer.clear()
-        return loss_info
+        # return loss_info
 
 
 
-def ppo_train(
-    env,
-    agent,
-    run_id,
-    total_timesteps=600_000,
-    rollout_length=1024,
-    log_interval=100,
-    record_every=100_000,
-    env_id="LunarLander-v3",
-    continuous=False,
-    video_folder="videos",
-):
+# def ppo_train(
+#     env,
+#     agent,
+#     run_id,
+#     total_timesteps=600_000,
+#     rollout_length=1024,
+#     log_interval=100,
+#     record_every=100_000,
+#     env_id="LunarLander-v3",
+#     continuous=False,
+#     video_folder="videos",
+# ):
 
-    logger = ScratchLogger()
+#     logger = ScratchLogger()
 
-    ep_reward = 0
-    episode = 0
+#     ep_reward = 0
+#     episode = 0
 
-    reward_window = deque(maxlen=100)
-
-
-    for t in range(1, total_timesteps + 1):
-
-        # -------- ACTION --------
-        action, log_prob, value, stored_action = agent.select_action(state)
-
-        next_state, reward, terminated, truncated, _ = env.step(action)
-        done = terminated or truncated
-
-        agent.buffer.add(state, stored_action, log_prob, reward, done, value)
-
-        state = next_state
-        ep_reward += reward
-
-        # -------- EPISODE END --------
-        if done:
-            episode += 1
-
-            reward_window.append(ep_reward)
-
-            logger.rewards.append(ep_reward)
-            logger.terminal_steps.append(t)
-
-            if episode % log_interval == 0:
-                print(
-                    f"Episode {episode}, "
-                    f"Timestep {t}, "
-                    f"Mean(100) Reward: {np.mean(reward_window):.2f}"
-                )
-
-            state, _ = env.reset()
-            ep_reward = 0
-
-        # -------- PPO UPDATE --------
-        if t % rollout_length == 0:
-            loss_info = agent.update()
-
-            logger.policy_losses.append(np.mean(loss_info["policy"]))
-            logger.value_losses.append(np.mean(loss_info["value"]))
-            logger.loss_steps.append(t)
+#     reward_window = deque(maxlen=100)
 
 
-    return logger
+#     for t in range(1, total_timesteps + 1):
+
+#         # -------- ACTION --------
+#         action, log_prob, value, stored_action = agent.select_action(state)
+
+#         next_state, reward, terminated, truncated, _ = env.step(action)
+#         done = terminated or truncated
+
+#         agent.buffer.add(state, stored_action, log_prob, reward, done, value)
+
+#         state = next_state
+#         ep_reward += reward
+
+#         # -------- EPISODE END --------
+#         if done:
+#             episode += 1
+
+#             reward_window.append(ep_reward)
+
+#             logger.rewards.append(ep_reward)
+#             logger.terminal_steps.append(t)
+
+#             if episode % log_interval == 0:
+#                 print(
+#                     f"Episode {episode}, "
+#                     f"Timestep {t}, "
+#                     f"Mean(100) Reward: {np.mean(reward_window):.2f}"
+#                 )
+
+#             state, _ = env.reset()
+#             ep_reward = 0
+
+#         # -------- PPO UPDATE --------
+#         if t % rollout_length == 0:
+#             loss_info = agent.update()
+
+#             logger.policy_losses.append(np.mean(loss_info["policy"]))
+#             logger.value_losses.append(np.mean(loss_info["value"]))
+#             logger.loss_steps.append(t)
+
+
+#     return logger
 
 
 def main(seed, num_updates, run):
@@ -210,7 +216,7 @@ def main(seed, num_updates, run):
     activation_list = ['relu', 'relu', 'tanh', 'relu', 'tanh',
                        'relu', 'tanh', 'relu', 'tanh', 'relu']
     gamma = 0.99
-
+    rollout_length = 2048
     hidden_sizes_list = [[128, 128, 256], [64, 64], [128, 128], [128, 256], [256, 256],
                          [512], [64, 128, 64], [32, 32], [512, 512], [1024]]
 
@@ -223,9 +229,9 @@ def main(seed, num_updates, run):
                 state_size, action_size, 
                 hidden_sizes_list[i % len(hidden_sizes_list)], 
                 activation_list[i % len(activation_list)]
-            ).to(self.device),
+            ),
             lr_list[i % len(lr_list)],
-            gamma, device=device
+            gamma
         )
         for i in range(agents_count)
     ]
@@ -234,11 +240,11 @@ def main(seed, num_updates, run):
     all_terminal_steps = [[] for _ in range(agents_count)] 
 
     pbar = tqdm(range(num_updates), unit="update")
-    for T in enumerate(pbar):
+    for T in pbar:
         
         # Collect rollouts in parallel
         with ThreadPoolExecutor(max_workers=agents_count) as executor:
-            executor.map(lambda a: a.collect_rollout(T, ROLLOUT_LENGTH), agents)
+            executor.map(lambda a: a.collect_rollout(T, rollout_length), agents)
         
         # Update all agents
         for agent in agents:
@@ -252,11 +258,11 @@ def main(seed, num_updates, run):
         
         rolling_avgs = []
         for i in range(agents_count):
-            window = all_rewards[i][-10:] if all_rewards[i] else [0]
+            window = all_rewards[i][-100:] if all_rewards[i] else [0]
             rolling_avgs.append(sum(window) / len(window))
 
         avg_rolling = sum(rolling_avgs) / agents_count
-        timestep    = (T + 1) * self.rollout_length
+        timestep    = (T + 1) * rollout_length
 
         pbar.set_postfix({
             "timestep":    timestep,
@@ -279,7 +285,7 @@ if __name__ == "__main__":
     for run in range(1):
         print(f"\nRun {run + 1}:")
         seed  = 20 + run * 5
-        num_updates=500 
+        num_updates=1000
         print(f"Seed: {seed}")
         main(seed, num_updates, run)
 
