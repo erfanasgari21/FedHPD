@@ -1,5 +1,5 @@
 from torch.utils.tensorboard import SummaryWriter
-
+from rollout_buffer import RolloutBuffer
 import numpy as np
 import torch
 import torch.optim as optim
@@ -211,12 +211,16 @@ class Agent:
 
 
 def main(seed, num_updates, run):
-    agents_count = 2
+    agents_count = 10
     seeds = [seed + i*1000 for i in range(agents_count)]
-    envs         = [gym.make('LunarLander-v3') for _ in range(agents_count)]
+
+    # فقط یک بار seed کلی
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    # ساخت envها با seed جدا
+    envs = [gym.make('LunarLander-v3') for _ in range(agents_count)]
     for i, env in enumerate(envs):
-        np.random.seed(seeds[i])
-        torch.manual_seed(seeds[i])
         env.reset(seed=seeds[i])
 
     state_size  = envs[0].observation_space.shape[0]
@@ -231,22 +235,26 @@ def main(seed, num_updates, run):
     hidden_sizes_list = [[128, 128, 256], [64, 64], [128, 128], [128, 256], [256, 256],
                          [512], [64, 128, 64], [32, 32], [512, 512], [1024]]
 
-    state_size, action_size,
-            
-    agents = [
-        Agent(
-            envs[i], 
-            PPOActorCriticNetwork( 
-                state_size, action_size, 
-                hidden_sizes_list[i % len(hidden_sizes_list)], 
-                activation_list[i % len(activation_list)]
-            ),
-            lr_list[i % len(lr_list)],
-            gamma,
-            entropy_coef=0.01,
+    # ساخت Agentها (هر کدام مدل با seed خودش)
+    agents = []
+    for i in range(agents_count):
+        torch.manual_seed(seeds[i])  # ✅ وزن اولیه هر مدل متفاوت و reproducible
+
+        model = PPOActorCriticNetwork(
+            state_size, action_size,
+            hidden_sizes_list[i % len(hidden_sizes_list)],
+            activation_list[i % len(activation_list)]
         )
-        for i in range(agents_count)
-    ]
+
+        agents.append(
+            Agent(
+                envs[i],
+                model,
+                lr=lr_list[i % len(lr_list)],
+                gamma=gamma,
+                entropy_coef=0.01,
+            )
+        )
 
     all_rewards = [[] for _ in range(agents_count)] 
     all_terminal_steps = [[] for _ in range(agents_count)] 
@@ -320,7 +328,7 @@ if __name__ == "__main__":
     for run in range(1):
         print(f"\nRun {run + 1}:")
         seed  = 20 + run * 5
-        num_updates=1000
+        num_updates=500
         print(f"Seed: {seed}")
         main(seed, num_updates, run)
 
