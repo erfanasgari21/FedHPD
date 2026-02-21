@@ -49,6 +49,8 @@ class Agent:
         self.gae_lambda = 0.95
         self.epochs     = PPO_EPOCHS
         self.batch_size = 64
+        self.kd_optimizer = optim.Adam(self.policy.actor_head.parameters(), lr=lr * 0.5)
+        
     def collect_rollout(self, rollout_length):
       # شروع: اگر state نگه نمی‌داری، اینجا reset کن
       obs, _ = self.env.reset()
@@ -166,28 +168,28 @@ class Agent:
       }
     def calculate_kd_loss(self, sampled_states_part, avg_probs):
       """
-      Minimize KL(P_k || P_global) over public states.
-      Teacher (avg_probs) باید ثابت و detach شده باشد.
+      KD فقط روی actor_head آپدیت می‌کند (نه shared و نه critic).
       """
-      logits, _ = self.policy(sampled_states_part)
+
+      # ✅ shared بدون گرادیان (قطع مسیر backprop به بدنه مشترک)
+      with torch.no_grad():
+          x = self.policy.shared(sampled_states_part)
+
+      # ✅ logits فقط از actor_head (گرادیان فقط برای actor_head ساخته می‌شود)
+      logits = self.policy.actor_head(x)
       student = Categorical(logits=logits)
 
       with torch.no_grad():
           teacher = Categorical(probs=avg_probs)
 
-      KD_ALPHA = 0.5
+      KD_ALPHA = 0.1
       kd_loss = KD_ALPHA * torch.distributions.kl.kl_divergence(student, teacher).mean()
 
-      self.optimizer.zero_grad()
+      # ✅ فقط actor_head آپدیت می‌شود
+      self.kd_optimizer.zero_grad()
       kd_loss.backward()
-
-      # جلوگیری از تغییر critic در KD
-      for p in self.policy.critic_head.parameters():
-          if p.grad is not None:
-              p.grad.zero_()
-
-      torch.nn.utils.clip_grad_norm_(self.policy.parameters(), MAX_GRAD_NORM)
-      self.optimizer.step()
+      torch.nn.utils.clip_grad_norm_(self.policy.actor_head.parameters(), MAX_GRAD_NORM)
+      self.kd_optimizer.step()
 
       return kd_loss.item()
 
