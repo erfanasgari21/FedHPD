@@ -49,7 +49,7 @@ class Agent:
         self.gae_lambda = 0.95
         self.epochs     = PPO_EPOCHS
         self.batch_size = 64
-        self.kd_optimizer = optim.Adam(self.policy.actor_head.parameters(), lr=lr * 0.5)
+        self.kd_optimizer = optim.SGD(self.policy.actor_head.parameters(), lr=lr * 0.5)
         
     def collect_rollout(self, rollout_length):
       # شروع: اگر state نگه نمی‌داری، اینجا reset کن
@@ -182,7 +182,7 @@ class Agent:
       with torch.no_grad():
           teacher = Categorical(probs=avg_probs)
 
-      KD_ALPHA = 0.1
+      KD_ALPHA = 1
       kd_loss = KD_ALPHA * torch.distributions.kl.kl_divergence(student, teacher).mean()
 
       # ✅ فقط actor_head آپدیت می‌شود
