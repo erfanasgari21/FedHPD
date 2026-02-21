@@ -1,3 +1,4 @@
+from torch.utils.tensorboard import SummaryWriter
 import gymnasium as gym
 import numpy as np
 import torch
@@ -11,6 +12,7 @@ from torch.distributions import Categorical
 from policy import PPOActorCriticNetwork
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
+from rollout_buffer import RolloutBuffer
 
 device = torch.device("cpu")
 
@@ -41,104 +43,139 @@ class Agent:
         self.policy = PPOActorCriticNetwork(state_size, action_size, hidden_sizes, activation_fn).to(self.device)
         self.optimizer = optim.Adam(self.policy.parameters(), lr=lr)
         self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=100, gamma=0.95)
+        self.buffer = RolloutBuffer()
 
-    def train_ppo(self):
-        """
-        Collect a full episode of experience, then run PPO_EPOCHS of
-        clipped surrogate + value + entropy updates on the collected data.
-        """
-        # ── 1. Rollout ────────────────────────────────────────────────────────
-        obs, _ = self.env.reset()
-        states, actions, log_probs_old, rewards, values = [], [], [], [], []
-        done = False
+        # PPO minibatch settings (مثل non-fed)
+        self.gae_lambda = 0.95
+        self.epochs     = PPO_EPOCHS
+        self.batch_size = 64
+    def collect_rollout(self, rollout_length):
+      # شروع: اگر state نگه نمی‌داری، اینجا reset کن
+      obs, _ = self.env.reset()
+      self.buffer.clear()
 
-        with torch.no_grad():
-            while not done:
-                state = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
-                action_probs, value = self.policy(state)
+      for t in range(rollout_length):
+          state = torch.tensor(obs, dtype=torch.float32, device=self.device)
 
-                dist = Categorical(action_probs)
-                action = dist.sample()
-                log_prob = dist.log_prob(action)
+          with torch.no_grad():
+              action, log_prob, value = self.policy.act(state)
 
-                next_obs, reward, terminated, truncated, _ = self.env.step(action.item())
-                done = terminated or truncated
+          next_obs, reward, terminated, truncated, _ = self.env.step(int(action.item()))
 
-                states.append(state)
-                actions.append(action)
-                log_probs_old.append(log_prob)
-                rewards.append(reward)
-                values.append(value.squeeze())
+          # ✅ TimeLimit bootstrap (اگر truncation بود ولی termination نبود)
+          if truncated and (not terminated):
+              with torch.no_grad():
+                  s_next = torch.tensor(next_obs, dtype=torch.float32, device=self.device)
+                  _, v_next = self.policy.forward(s_next)
+                  reward = reward + self.gamma * float(v_next.item())
 
-                obs = next_obs
+          done = terminated or truncated
 
-        # ── 2. Compute discounted returns and advantages ───────────────────────
-        returns = []
-        G = 0
-        for r in reversed(rewards):
-            G = r + self.gamma * G
-            returns.insert(0, G)
+          self.buffer.add(obs, int(action.item()), float(log_prob.item()), reward, done, float(value.item()))
+          obs = next_obs
 
-        returns = torch.tensor(returns, dtype=torch.float32).to(self.device)
-        returns = (returns - returns.mean()) / (returns.std() + 1e-5)   # normalise
+          if done:
+              obs, _ = self.env.reset()
 
-        values_tensor = torch.stack(values).to(self.device)             # (T,)
-        advantages = returns - values_tensor.detach()
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-5)
+      # bootstrap value برای آخر rollout
+      last_done = self.buffer.dones[-1]
+      if last_done:
+          last_value = 0.0
+      else:
+          with torch.no_grad():
+              s = torch.tensor(obs, dtype=torch.float32, device=self.device)
+              _, v = self.policy.forward(s)
+              last_value = float(v.item())
+      total_reward = float(np.sum(self.buffer.rewards))
+      return last_value, total_reward
+     
+    def update_ppo(self, last_value):
+      states = torch.tensor(np.array(self.buffer.states), dtype=torch.float32, device=self.device)
+      actions = torch.tensor(self.buffer.actions, dtype=torch.long, device=self.device)
+      old_log_probs = torch.tensor(self.buffer.log_probs, dtype=torch.float32, device=self.device)
 
-        # Stack collected tensors
-        states_tensor    = torch.cat(states, dim=0)                     # (T, state_dim)
-        actions_tensor   = torch.cat(actions, dim=0)                    # (T,)
-        log_probs_old_t  = torch.cat([lp.unsqueeze(0) for lp in log_probs_old]).to(self.device)  # (T,)
+      returns, advantages = self.buffer.compute_returns_and_advantages(
+          gamma=self.gamma, gae_lambda=self.gae_lambda, last_value=last_value
+      )
+      returns = returns.to(self.device)
+      advantages = advantages.to(self.device)
+      advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-        # ── 3. PPO update epochs ──────────────────────────────────────────────
-        for _ in range(PPO_EPOCHS):
-            # Fresh forward pass (with gradients this time)
-            action_probs_new, values_new = self.policy(states_tensor)
-            dist_new = Categorical(action_probs_new)
-            log_probs_new = dist_new.log_prob(actions_tensor)
-            entropy = dist_new.entropy().mean()
+      dataset_size = states.size(0)
+      indices = np.arange(dataset_size)
+      policy_losses = []
+      value_losses  = []
+      entropies     = []
+      approx_kls    = []
+      clipfracs     = []
+      for _ in range(self.epochs):
+          np.random.shuffle(indices)
+          for start in range(0, dataset_size, self.batch_size):
+              end = start + self.batch_size
+              batch_idx = indices[start:end]
 
-            # Clipped surrogate objective
-            ratio = torch.exp(log_probs_new - log_probs_old_t)
-            surr1 = ratio * advantages
-            surr2 = torch.clamp(ratio, 1.0 - PPO_CLIP, 1.0 + PPO_CLIP) * advantages
-            actor_loss = -torch.min(surr1, surr2).mean()
+              log_probs, entropy, values = self.policy.evaluate(
+                  states[batch_idx], actions[batch_idx]
+              )
 
-            # Value loss (MSE between predicted values and discounted returns)
-            critic_loss = VALUE_COEF * torch.nn.functional.mse_loss(
-                values_new.squeeze(), returns
-            )
+              ratio = torch.exp(log_probs - old_log_probs[batch_idx])
+              surr1 = ratio * advantages[batch_idx]
+              surr2 = torch.clamp(ratio, 1.0 - PPO_CLIP, 1.0 + PPO_CLIP) * advantages[batch_idx]
 
-            # Total loss
-            loss = actor_loss + critic_loss - ENTROPY_COEF * entropy
+              actor_loss  = -torch.min(surr1, surr2).mean()
+              critic_loss = VALUE_COEF * (returns[batch_idx] - values).pow(2).mean()
+              entropy_loss = entropy.mean()
+              with torch.no_grad():
+                  # approx_kl ≈ mean(old_logp - new_logp)
+                  approx_kl = (old_log_probs[batch_idx] - log_probs).mean().item()
 
-            self.optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), MAX_GRAD_NORM)
-            self.optimizer.step()
+                  # clipfrac: درصد ratioهایی که کلیپ شده‌اند
+                  clipfrac = ((ratio - 1.0).abs() > PPO_CLIP).float().mean().item()
 
-        self.scheduler.step()
-        return sum(rewards)
+              policy_losses.append(actor_loss.item())
+              value_losses.append(critic_loss.item())
+              entropies.append(entropy_loss.item())
+              approx_kls.append(approx_kl)
+              clipfracs.append(clipfrac)
 
+              loss = actor_loss + critic_loss - ENTROPY_COEF * entropy_loss
+
+              self.optimizer.zero_grad()
+              loss.backward()
+              torch.nn.utils.clip_grad_norm_(self.policy.parameters(), MAX_GRAD_NORM)
+              self.optimizer.step()
+
+      self.scheduler.step()
+      self.buffer.clear()
+      return {
+          "policy_loss": float(np.mean(policy_losses)) if policy_losses else 0.0,
+          "value_loss":  float(np.mean(value_losses))  if value_losses  else 0.0,
+          "entropy":     float(np.mean(entropies))     if entropies     else 0.0,
+          "approx_kl":   float(np.mean(approx_kls))    if approx_kls    else 0.0,
+          "clipfrac":    float(np.mean(clipfracs))     if clipfracs     else 0.0,
+      }
     def calculate_kd_loss(self, sampled_states_part, agent_probs, avg_probs):
-        """
-        Knowledge-distillation step: pull this agent's action distribution
-        toward the federated average using KL divergence.
-        Only the actor head is involved here.
-        """
-        # PPOActorCriticNetwork returns (action_probs, value); we only need probs
-        output_probs, _ = self.policy(sampled_states_part)
+      """
+      Minimize KL(P_k || P_global) over public states.
+      """
+      logits, _ = self.policy(sampled_states_part)
+      student = Categorical(logits=logits)
 
-        kd_loss = torch.nn.functional.kl_div(
-            output_probs.log(), avg_probs, reduction='batchmean'
-        )
+      with torch.no_grad():
+          teacher = Categorical(probs=avg_probs)
 
-        self.optimizer.zero_grad()
-        kd_loss.backward()
-        self.optimizer.step()
+      KD_ALPHA = 0.1  # یا 0.05
+      kd_loss = KD_ALPHA * torch.distributions.kl.kl_divergence(student, teacher).mean()
+      self.optimizer.zero_grad()
+      kd_loss.backward()
+      # جلوگیری از تغییر critic در KD
+      for p in self.policy.critic_head.parameters():
+          if p.grad is not None:
+              p.grad.zero_()
+      torch.nn.utils.clip_grad_norm_(self.policy.parameters(), MAX_GRAD_NORM)
+      self.optimizer.step()
 
-        return kd_loss.item()
+      return kd_loss.item()
 
 
 class Server:
@@ -147,43 +184,51 @@ class Server:
         self.device = device
 
     def collect_and_average_probs(self, sampled_states):
-        # PPOActorCriticNetwork returns (action_probs, value) — detach only action_probs
-        agent_probs = [agent.policy(sampled_states)[0].detach() for agent in self.agents]
-        avg_probs = federated_average(agent_probs)
-        return agent_probs, avg_probs
+      # هر ایجنت: logits -> probs
+      agent_probs = []
+      for agent in self.agents:
+          logits, _ = agent.policy(sampled_states)
+          probs = torch.softmax(logits, dim=-1)
+          agent_probs.append(probs.detach())
+
+      # average روی probs
+      avg_probs = torch.mean(torch.stack(agent_probs, dim=0), dim=0)
+      avg_probs = avg_probs / (avg_probs.sum(dim=-1, keepdim=True) + 1e-8)
+      return agent_probs, avg_probs
 
 
 def main(seed, episodes, distill_interval, run):
-    seeds = [seed] * 8
     agents_count = 8
+    seeds = [seed + 1000*i for i in range(agents_count)]
+
     envs = [gym.make('LunarLander-v3') for _ in range(agents_count)]
     for i, env in enumerate(envs):
-        np.random.seed(seeds[i])
-        torch.manual_seed(seeds[i])
         env.reset(seed=seeds[i])
 
     state_size  = envs[0].observation_space.shape[0]
     action_size = envs[0].action_space.n
-
-    lr_list = [5e-4, 1e-3, 4e-4, 6e-4, 3e-4,
-               4e-4, 5e-4, 1e-3, 2e-4, 1e-4]
+    lr_list = [1e-4, 1e-4, 1e-4, 1e-4, 3e-4,
+               4e-4, 5e-4, 1e-4, 2e-4, 1e-4]
     activation_list = ['relu', 'relu', 'tanh', 'relu', 'tanh',
                        'relu', 'tanh', 'relu', 'tanh', 'relu']
     gamma = 0.99
-
+    rollout_length = 2048
     hidden_sizes_list = [[128, 128, 256], [64, 64], [128, 128], [128, 256], [256, 256],
                          [512], [64, 128, 64], [32, 32], [512, 512], [1024]]
+    agents = []
+    for i in range(agents_count):
+        np.random.seed(seeds[i])
+        torch.manual_seed(seeds[i])   # مهم: قبل از ساخت شبکه/مدل
 
-    agents = [
-        Agent(
-            envs[i], state_size, action_size,
-            hidden_sizes_list[i % len(hidden_sizes_list)],
-            lr_list[i % len(lr_list)],
-            activation_list[i % len(activation_list)],
-            gamma, device=device
+        agents.append(
+            Agent(
+                envs[i], state_size, action_size,
+                hidden_sizes_list[i % len(hidden_sizes_list)],
+                lr_list[i % len(lr_list)],
+                activation_list[i % len(activation_list)],
+                gamma, device=device
+            )
         )
-        for i in range(agents_count)
-    ]
 
     server = Server(agents, device)
 
@@ -191,18 +236,40 @@ def main(seed, episodes, distill_interval, run):
     average_rewards   = []
     kd_losses         = {f'Agent {i + 1}': [] for i in range(agents_count)}
 
+# ── Setup Live Logging ────────────────────────────────────────────────────
+    timestamp_start = datetime.now().strftime('%Y%m%d_%H%M%S')
+    
+    # ساخت فایل متنی برای لاگ زنده
+    log_file = open(f"results/live_log_FedPPO_run{run}_{timestamp_start}.txt", "w")
+    log_file.write("Episode,System_Avg_Reward,Rolling_100_Avg\n")
+    
+    # راه اندازی تنسوربورد
+    writer = SummaryWriter(log_dir=f"runs/FedPPO_run{run}_{timestamp_start}")
     pbar = tqdm(range(episodes), unit="ep")
-    for episode in range(episodes):
+    for episode in pbar:
 
         # ── Parallel PPO training via ThreadPoolExecutor ──────────────────────
-        with ThreadPoolExecutor(max_workers=agents_count) as executor:
-            total_rewards = list(executor.map(lambda a: a.train_ppo(), agents))
+        rollout_length = 2048  # می‌تونی بیرون حلقه هم تعریفش کنی
 
+        with ThreadPoolExecutor(max_workers=agents_count) as executor:
+            rollout_results = list(executor.map(lambda a: a.collect_rollout(rollout_length), agents))
+
+        last_values   = [x[0] for x in rollout_results]
+        total_rewards = [x[1] for x in rollout_results]
+        ppo_infos = []
+        for agent, last_v in zip(agents, last_values):
+            info = agent.update_ppo(last_v)
+            ppo_infos.append(info)
         for i, reward in enumerate(total_rewards):
             rewards_per_agent[i].append(reward)
 
         average_reward = sum(total_rewards) / len(total_rewards)
         average_rewards.append(average_reward)
+        # ✅ Rolling-100 برای هر ایجنت (برای نمودار کم‌نوسان‌تر)
+        for i in range(agents_count):
+            window = rewards_per_agent[i][-100:]
+            agent_roll100 = sum(window) / len(window)
+            writer.add_scalar(f"Agents_Rolling100/Agent_{i+1}", agent_roll100, episode + 1)
 
         # Compute rolling 100-episode average across all agents
         all_recent = [
@@ -214,7 +281,23 @@ def main(seed, episodes, distill_interval, run):
             "avg_reward": f"{average_reward:.2f}",
             "rolling_100": f"{rolling_avg:.2f}"
         })
-
+        # ── Write Live Logs ───────────────────────────────────────────────────
+        # ذخیره در فایل متنی و اجبار سیستم به نوشتن آنی (flush)
+        log_file.write(f"{episode + 1},{average_reward:.2f},{rolling_avg:.2f}\n")
+        log_file.flush()
+        
+        # ارسال اطلاعات به تنسوربورد
+        writer.add_scalar("Reward/System_Episode_Avg", average_reward, episode + 1)
+        writer.add_scalar("Reward/System_Rolling_100", rolling_avg, episode + 1)
+        # ✅ PPO metrics (system average)
+        writer.add_scalar("PPO/policy_loss", np.mean([x["policy_loss"] for x in ppo_infos]), episode + 1)
+        writer.add_scalar("PPO/value_loss",  np.mean([x["value_loss"]  for x in ppo_infos]), episode + 1)
+        writer.add_scalar("PPO/entropy",     np.mean([x["entropy"]     for x in ppo_infos]), episode + 1)
+        writer.add_scalar("PPO/approx_kl",   np.mean([x["approx_kl"]   for x in ppo_infos]), episode + 1)
+        writer.add_scalar("PPO/clipfrac",    np.mean([x["clipfrac"]    for x in ppo_infos]), episode + 1)
+        # ارسال پاداش هر ایجنت به صورت جداگانه
+        for idx, reward in enumerate(total_rewards):
+            writer.add_scalar(f"Agents_Reward/Agent_{idx + 1}", reward, episode + 1)
         # print(f"Episode {episode + 1}:")
         # for idx, reward in enumerate(total_rewards):
         #     history = rewards_per_agent[idx]
@@ -254,9 +337,11 @@ def main(seed, episodes, distill_interval, run):
 
                     for agent_idx, agent in enumerate(agents):
                         kd_loss = agent.calculate_kd_loss(sampled_states_part, agent_probs, avg_probs)
+
                         kd_losses[f'Agent {agent_idx + 1}'].append(
                             (episode + 1, distillation_round + 1, kd_loss)
                         )
+                        writer.add_scalar(f"KD/loss_agent_{agent_idx+1}", kd_loss, episode + 1)
                         # print(f"  Agent {agent_idx + 1} | KD Loss: {kd_loss:.4f}")
 
                     # print(f"  Part {part_idx + 1} done.")
@@ -271,13 +356,15 @@ def main(seed, episodes, distill_interval, run):
 
     avg_df = pd.DataFrame({'Episode': range(1, episodes + 1), 'Average Reward': average_rewards})
     avg_df.to_csv(f'results/rewards_Lunar_PPO_{run}_{timestamp}.csv', index=False)
+    log_file.close()
+    writer.close()
 
 
 if __name__ == "__main__":
-    for run in range(3):
+    for run in range(1):
         print(f"\nRun {run + 1}:")
         seed = 20 + run * 5
-        episodes = 3000
+        episodes = 500
         distill_interval = 5
         print(f"Seed: {seed}, Episodes: {episodes}, Distill Interval: {distill_interval}")
         main(seed, episodes, distill_interval, run)
