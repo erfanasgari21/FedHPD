@@ -215,7 +215,7 @@ class Server:
 
 
 def main(seed, episodes, distill_interval, run):
-    agents_count = 3
+    agents_count = 5
     seeds = [seed + 1000*i for i in range(agents_count)]
 
     envs = [gym.make('LunarLander-v3') for _ in range(agents_count)]
