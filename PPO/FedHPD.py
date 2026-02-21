@@ -53,6 +53,8 @@ class Agent:
       # شروع: اگر state نگه نمی‌داری، اینجا reset کن
       obs, _ = self.env.reset()
       self.buffer.clear()
+      episodic_returns = []
+      ep_return = 0.0
 
       for t in range(rollout_length):
           state = torch.tensor(obs, dtype=torch.float32, device=self.device)
@@ -61,7 +63,8 @@ class Agent:
               action, log_prob, value = self.policy.act(state)
 
           next_obs, reward, terminated, truncated, _ = self.env.step(int(action.item()))
-
+          raw_reward = reward               # ✅ برای لاگ اپیزودی
+          ep_return += float(raw_reward)    # ✅ episodic return واقعی
           # ✅ TimeLimit bootstrap (اگر truncation بود ولی termination نبود)
           if truncated and (not terminated):
               with torch.no_grad():
@@ -70,6 +73,9 @@ class Agent:
                   reward = reward + self.gamma * float(v_next.item())
 
           done = terminated or truncated
+          if done:
+            episodic_returns.append(ep_return)
+            ep_return = 0.0
 
           self.buffer.add(obs, int(action.item()), float(log_prob.item()), reward, done, float(value.item()))
           obs = next_obs
@@ -86,8 +92,12 @@ class Agent:
               s = torch.tensor(obs, dtype=torch.float32, device=self.device)
               _, v = self.policy.forward(s)
               last_value = float(v.item())
-      total_reward = float(np.sum(self.buffer.rewards))
-      return last_value, total_reward
+      if len(episodic_returns) > 0:
+          reported_reward = float(np.mean(episodic_returns))  # ✅ میانگین اپیزودهای کامل داخل rollout
+      else:
+          reported_reward = float(ep_return)  # اگر هیچ اپیزود کاملی تمام نشد
+
+      return last_value, reported_reward
      
     def update_ppo(self, last_value):
       states = torch.tensor(np.array(self.buffer.states), dtype=torch.float32, device=self.device)
@@ -154,9 +164,10 @@ class Agent:
           "approx_kl":   float(np.mean(approx_kls))    if approx_kls    else 0.0,
           "clipfrac":    float(np.mean(clipfracs))     if clipfracs     else 0.0,
       }
-    def calculate_kd_loss(self, sampled_states_part, agent_probs, avg_probs):
+    def calculate_kd_loss(self, sampled_states_part, avg_probs):
       """
       Minimize KL(P_k || P_global) over public states.
+      Teacher (avg_probs) باید ثابت و detach شده باشد.
       """
       logits, _ = self.policy(sampled_states_part)
       student = Categorical(logits=logits)
@@ -164,14 +175,17 @@ class Agent:
       with torch.no_grad():
           teacher = Categorical(probs=avg_probs)
 
-      KD_ALPHA = 0.1  # یا 0.05
+      KD_ALPHA = 0.5
       kd_loss = KD_ALPHA * torch.distributions.kl.kl_divergence(student, teacher).mean()
+
       self.optimizer.zero_grad()
       kd_loss.backward()
+
       # جلوگیری از تغییر critic در KD
       for p in self.policy.critic_head.parameters():
           if p.grad is not None:
               p.grad.zero_()
+
       torch.nn.utils.clip_grad_norm_(self.policy.parameters(), MAX_GRAD_NORM)
       self.optimizer.step()
 
@@ -184,21 +198,22 @@ class Server:
         self.device = device
 
     def collect_and_average_probs(self, sampled_states):
-      # هر ایجنت: logits -> probs
-      agent_probs = []
-      for agent in self.agents:
-          logits, _ = agent.policy(sampled_states)
-          probs = torch.softmax(logits, dim=-1)
-          agent_probs.append(probs.detach())
+        agent_probs = []
+        with torch.no_grad():  # ✅ این اضافه شد
+            for agent in self.agents:
+                logits, _ = agent.policy(sampled_states)
+                probs = torch.softmax(logits, dim=-1)
+                agent_probs.append(probs)
 
-      # average روی probs
-      avg_probs = torch.mean(torch.stack(agent_probs, dim=0), dim=0)
-      avg_probs = avg_probs / (avg_probs.sum(dim=-1, keepdim=True) + 1e-8)
-      return agent_probs, avg_probs
+            avg_probs = torch.mean(torch.stack(agent_probs, dim=0), dim=0)
+            avg_probs = avg_probs / (avg_probs.sum(dim=-1, keepdim=True) + 1e-8)
+
+        # برای اطمینان از ثابت بودن و عدم ساخت گراف
+        return [p.detach() for p in agent_probs], avg_probs.detach()
 
 
 def main(seed, episodes, distill_interval, run):
-    agents_count = 8
+    agents_count = 3
     seeds = [seed + 1000*i for i in range(agents_count)]
 
     envs = [gym.make('LunarLander-v3') for _ in range(agents_count)]
@@ -265,11 +280,14 @@ def main(seed, episodes, distill_interval, run):
 
         average_reward = sum(total_rewards) / len(total_rewards)
         average_rewards.append(average_reward)
+        # تعریف محاسبه timestep دقیقاً مشابه کد بیس‌لاین
+        timestep = (episode + 1) * rollout_length
+
         # ✅ Rolling-100 برای هر ایجنت (برای نمودار کم‌نوسان‌تر)
         for i in range(agents_count):
             window = rewards_per_agent[i][-100:]
             agent_roll100 = sum(window) / len(window)
-            writer.add_scalar(f"Agents_Rolling100/Agent_{i+1}", agent_roll100, episode + 1)
+            writer.add_scalar(f"Agents_Rolling100/Agent_{i+1}", agent_roll100, timestep)
 
         # Compute rolling 100-episode average across all agents
         all_recent = [
@@ -287,17 +305,17 @@ def main(seed, episodes, distill_interval, run):
         log_file.flush()
         
         # ارسال اطلاعات به تنسوربورد
-        writer.add_scalar("Reward/System_Episode_Avg", average_reward, episode + 1)
-        writer.add_scalar("Reward/System_Rolling_100", rolling_avg, episode + 1)
+        writer.add_scalar("Reward/System_Episode_Avg", average_reward, timestep)
+        writer.add_scalar("Reward/System_Rolling_100", rolling_avg, timestep)
         # ✅ PPO metrics (system average)
-        writer.add_scalar("PPO/policy_loss", np.mean([x["policy_loss"] for x in ppo_infos]), episode + 1)
-        writer.add_scalar("PPO/value_loss",  np.mean([x["value_loss"]  for x in ppo_infos]), episode + 1)
-        writer.add_scalar("PPO/entropy",     np.mean([x["entropy"]     for x in ppo_infos]), episode + 1)
-        writer.add_scalar("PPO/approx_kl",   np.mean([x["approx_kl"]   for x in ppo_infos]), episode + 1)
-        writer.add_scalar("PPO/clipfrac",    np.mean([x["clipfrac"]    for x in ppo_infos]), episode + 1)
+        writer.add_scalar("PPO/policy_loss", np.mean([x["policy_loss"] for x in ppo_infos]), timestep)
+        writer.add_scalar("PPO/value_loss",  np.mean([x["value_loss"]  for x in ppo_infos]), timestep)
+        writer.add_scalar("PPO/entropy",     np.mean([x["entropy"]     for x in ppo_infos]), timestep)
+        writer.add_scalar("PPO/approx_kl",   np.mean([x["approx_kl"]   for x in ppo_infos]), timestep)
+        writer.add_scalar("PPO/clipfrac",    np.mean([x["clipfrac"]    for x in ppo_infos]), timestep)
         # ارسال پاداش هر ایجنت به صورت جداگانه
         for idx, reward in enumerate(total_rewards):
-            writer.add_scalar(f"Agents_Reward/Agent_{idx + 1}", reward, episode + 1)
+            writer.add_scalar(f"Agents_Reward/Agent_{idx + 1}", reward, timestep)
         # print(f"Episode {episode + 1}:")
         # for idx, reward in enumerate(total_rewards):
         #     history = rewards_per_agent[idx]
@@ -310,44 +328,42 @@ def main(seed, episodes, distill_interval, run):
 
         # ── Federated Knowledge Distillation ──────────────────────────────────
         if (episode + 1) % distill_interval == 0:
-            csv_file = 'KD_state_10-from-each.csv'
-            df = pd.read_csv(csv_file)
-            sampled_states = df['State'].apply(
-                lambda x: torch.tensor([float(v) for v in x.split(',')])
-            )
-            sampled_states = torch.stack(sampled_states.values.tolist()).to(device)
+          csv_file = 'KD_state_10-from-each.csv'
+          df = pd.read_csv(csv_file)
+          sampled_states = df['State'].apply(
+              lambda x: torch.tensor([float(v) for v in x.split(',')])
+          )
+          sampled_states = torch.stack(sampled_states.values.tolist()).to(device)
 
-            dataset_size = sampled_states.size(0)
-            assert dataset_size == 10000, "sampled_states size should be 10000"
+          dataset_size = sampled_states.size(0)
+          assert dataset_size == 10000, "sampled_states size should be 10000"
 
-            quarter_size        = dataset_size // 4
-            sampled_states_parts = [
-                sampled_states[i * quarter_size: (i + 1) * quarter_size]
-                for i in range(4)
-            ]
+          quarter_size = dataset_size // 4
+          sampled_states_parts = [
+              sampled_states[i * quarter_size: (i + 1) * quarter_size]
+              for i in range(4)
+          ]
 
-            distill_loop = 5
-            for distillation_round in range(distill_loop):
-                # print(f"\nKnowledge Distillation Round {distillation_round + 1}:")
+          # ✅ 1) teacher را برای هر part فقط یک‌بار و قبل از هر آپدیت KD بساز
+          avg_probs_parts = []
+          for part in sampled_states_parts:
+              _, avg_probs = server.collect_and_average_probs(part)   # no_grad داخل سرور هست
+              avg_probs_parts.append(avg_probs)                       # detach شده
 
-                for part_idx, sampled_states_part in enumerate(sampled_states_parts):
-                    # print(f"  Processing part {part_idx + 1}")
+          distill_loop = 5
+          for distillation_round in range(distill_loop):
+              for part_idx, sampled_states_part in enumerate(sampled_states_parts):
+                  avg_probs_fixed = avg_probs_parts[part_idx]  # ✅ teacher ثابت
 
-                    agent_probs, avg_probs = server.collect_and_average_probs(sampled_states_part)
+                  for agent_idx, agent in enumerate(agents):
+                      kd_loss = agent.calculate_kd_loss(sampled_states_part, avg_probs_fixed)
 
-                    for agent_idx, agent in enumerate(agents):
-                        kd_loss = agent.calculate_kd_loss(sampled_states_part, agent_probs, avg_probs)
+                      kd_losses[f'Agent {agent_idx + 1}'].append(
+                          (episode + 1, distillation_round + 1, kd_loss)
+                      )
+                      writer.add_scalar(f"KD/loss_agent_{agent_idx+1}", kd_loss, timestep)
 
-                        kd_losses[f'Agent {agent_idx + 1}'].append(
-                            (episode + 1, distillation_round + 1, kd_loss)
-                        )
-                        writer.add_scalar(f"KD/loss_agent_{agent_idx+1}", kd_loss, episode + 1)
-                        # print(f"  Agent {agent_idx + 1} | KD Loss: {kd_loss:.4f}")
-
-                    # print(f"  Part {part_idx + 1} done.")
-                tqdm.write(f"Episode {episode + 1}: KD distillation completed.")
-                # print(f"KD Round {distillation_round + 1} Completed!")
-
+              tqdm.write(f"Episode {episode + 1}: KD distillation completed.")
     # ── Save results ──────────────────────────────────────────────────────────
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 
